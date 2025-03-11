@@ -1,5 +1,3 @@
-#!/usr/bin/python3
-
 import cv2
 import numpy as np
 import torch
@@ -8,7 +6,8 @@ import os
 
 # Load the model
 script_dir = os.path.dirname(os.path.abspath(__file__))
-model_path = os.path.join(script_dir, 'yolov8n.pt')  
+model_path = os.path.join(script_dir, 'best.pt')
+
 model = YOLO(model_path)
 
 # Open webcam

@@ -7,7 +7,7 @@ import glob
 
 # Load the model
 script_dir = os.path.dirname(os.path.abspath(__file__))
-model_path = os.path.join(script_dir, 'best.pt')
+model_path = os.path.join(script_dir, 'model1.pt')
 
 model = YOLO(model_path)
 

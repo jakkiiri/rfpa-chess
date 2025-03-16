@@ -6,12 +6,12 @@ import os
 
 # Load the model
 script_dir = os.path.dirname(os.path.abspath(__file__))
-model_path = os.path.join(script_dir, 'best.pt')
+model_path = os.path.join(script_dir, 'model1.pt')
 
 model = YOLO(model_path)
 
 # Open webcam
-cap = cv2.VideoCapture(0)
+cap = cv2.VideoCapture(1)
 
 while True:
     ret, frame = cap.read()

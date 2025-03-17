@@ -4,230 +4,220 @@ import torch
 from ultralytics import YOLO
 import os
 
+# ---------- 1. Helper Functions ----------
 def order_points(pts):
-    """Arrange quadrilateral points in consistent order (TL, TR, BR, BL)"""
+    """Arrange 4 corner points in consistent order: top-left, top-right, bottom-right, bottom-left."""
     rect = np.zeros((4, 2), dtype="float32")
     s = pts.sum(axis=1)
-    rect[0] = pts[np.argmin(s)]  # Top-left has smallest sum
-    rect[2] = pts[np.argmax(s)]  # Bottom-right has largest sum
+    rect[0] = pts[np.argmin(s)]
+    rect[2] = pts[np.argmax(s)]
     diff = np.diff(pts, axis=1)
-    rect[1] = pts[np.argmin(diff)]  # Top-right has smallest difference
-    rect[3] = pts[np.argmax(diff)]  # Bottom-left has largest difference
+    rect[1] = pts[np.argmin(diff)]
+    rect[3] = pts[np.argmax(diff)]
     return rect
 
-def hough_board_detection(gray):
-    """Fallback detection using Hough lines to find chessboard boundaries"""
+def validate_contour(contour, min_area=5000):
+    """Ensure contour is a valid quadrilateral (convex and above a minimum area)."""
+    if contour is None or len(contour) != 4:
+        return False
+    if not cv2.isContourConvex(contour):
+        return False
+    area = cv2.contourArea(contour)
+    return area >= min_area
+
+def find_board_contour(gray):
+    """Try to find a quadrilateral contour (the board) using Canny + Hough fallback."""
     edges = cv2.Canny(gray, 50, 150)
-    lines = cv2.HoughLinesP(edges, 1, np.pi/180, threshold=100, 
-                           minLineLength=100, maxLineGap=10)
-    
-    if lines is None:
-        return None
-    
-    vertical = []
-    horizontal = []
-    for line in lines:
-        x1, y1, x2, y2 = line[0]
-        angle = np.degrees(np.arctan2(y2-y1, x2-x1))
-        if abs(angle) < 30:  # Horizontal
-            horizontal.append((x1, y1, x2, y2))
-        elif abs(angle) > 60:  # Vertical
-            vertical.append((x1, y1, x2, y2))
-    
-    if len(vertical) < 2 or len(horizontal) < 2:
-        return None
-    
-    # Find line intersections
-    intersections = []
-    for v_line in vertical[:10]:  # Limit to 10 strongest vertical
-        for h_line in horizontal[:10]:  # Limit to 10 strongest horizontal
-            x1, y1, x2, y2 = v_line
-            x3, y3, x4, y4 = h_line
-            
-            # Calculate intersection point
-            denom = (x1 - x2)*(y3 - y4) - (y1 - y2)*(x3 - x4)
-            if denom == 0:
-                continue
-            px = ((x1*y2 - y1*x2)*(x3 - x4) - (x1 - x2)*(x3*y4 - y3*x4)) / denom
-            py = ((x1*y2 - y1*x2)*(y3 - y4) - (y1 - y2)*(x3*y4 - y3*x4)) / denom
-            intersections.append([px, py])
-    
-    if len(intersections) < 4:
-        return None
-    
-    # Find convex hull of intersections
-    hull = cv2.convexHull(np.array(intersections, dtype="float32"))
-    epsilon = 0.02 * cv2.arcLength(hull, True)
-    approx = cv2.approxPolyDP(hull, epsilon, True)
-    
-    return approx if len(approx) == 4 else None
+    contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-# ----- Initialization -----
-script_dir = os.path.dirname(os.path.abspath(__file__))
-model = YOLO(os.path.join(script_dir, 'model1.pt'))
-output_folder = os.path.join(script_dir, 'output_images')
-os.makedirs(output_folder, exist_ok=True)
+    # Method 1: Direct contour detection
+    for cnt in sorted(contours, key=cv2.contourArea, reverse=True)[:5]:
+        peri = cv2.arcLength(cnt, True)
+        approx = cv2.approxPolyDP(cnt, 0.02 * peri, True)
+        if len(approx) == 4 and validate_contour(approx):
+            return approx
 
-cap = cv2.VideoCapture(1)
-if not cap.isOpened():
-    print("Error: Webcam not accessible")
-    exit()
+    # Method 2: Hough line-based detection fallback
+    lines = cv2.HoughLinesP(edges, 1, np.pi/180, 100, minLineLength=100, maxLineGap=10)
+    if lines is not None:
+        vertical, horizontal = [], []
+        for line in lines:
+            x1, y1, x2, y2 = line[0]
+            angle = np.degrees(np.arctan2(y2 - y1, x2 - x1))
+            if abs(angle) < 20:   # near-horizontal
+                horizontal.append((x1, y1, x2, y2))
+            elif abs(angle) > 70: # near-vertical
+                vertical.append((x1, y1, x2, y2))
 
-# Chessboard configuration
-PATTERN_SIZE = (7, 7)  # Inner corners for 8x8 board
-GRID_SIZE = (8, 8)     # Actual board squares
-chessboard_state = [[None for _ in range(GRID_SIZE[1])] for _ in range(GRID_SIZE[0])]
-frame_count = 0
-
-print("Press SPACE to capture/process, Q to quit")
-
-# ----- Main Loop -----
-while True:
-    ret, frame = cap.read()
-    if not ret:
-        print("Frame capture error")
-        break
-    
-    cv2.imshow("Live Feed", frame)
-    key = cv2.waitKey(1) & 0xFF
-    
-    if key == ord('q'):
-        break
-    
-    if key == ord(' '):
-        print("\n--- Processing Frame ---")
-        original = frame.copy()
-        
-        # ----- Preprocessing -----
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        gray = cv2.bilateralFilter(gray, 9, 75, 75)
-        gray = cv2.GaussianBlur(gray, (5,5), 0)
-        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
-        gray = clahe.apply(gray)
-        
-        # ----- Board Detection -----
-        board_contour = None
-        
-        # Method 1: Contour detection
-        edges = cv2.Canny(gray, 50, 150)
-        contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        for cnt in sorted(contours, key=cv2.contourArea, reverse=True)[:5]:
-            peri = cv2.arcLength(cnt, True)
-            approx = cv2.approxPolyDP(cnt, 0.02*peri, True)
-            if len(approx) == 4 and cv2.contourArea(approx) > 5000:
-                board_contour = approx
-                break
-        
-        # Method 2: Hough lines fallback
-        if board_contour is None:
-            print("Contour detection failed, trying Hough lines...")
-            board_contour = hough_board_detection(gray)
-        
-        # Validate detection
-        if board_contour is None or len(board_contour) != 4:
-            print("Board detection failed. Adjust view and try again.")
-            cv2.imshow("Detection Failed", frame)
-            cv2.waitKey(1000)
-            continue
-        
-        # ----- Perspective Correction -----
-        try:
-            pts = board_contour.reshape(4, 2).astype("float32")
-            ordered_pts = order_points(pts)
-            
-            # Calculate transformation matrix
-            (tl, tr, br, bl) = ordered_pts
-            width = max(np.linalg.norm(tr - tl), np.linalg.norm(br - bl))
-            height = max(np.linalg.norm(bl - tl), np.linalg.norm(br - tr))
-            dst = np.array([[0,0], [width-1,0], [width-1,height-1], [0,height-1]], dtype="float32")
-            
-            M = cv2.getPerspectiveTransform(ordered_pts, dst)
-            warped = cv2.warpPerspective(original, M, (int(width), int(height)))
-            
-            # Visualize detection
-            cv2.drawContours(frame, [board_contour], -1, (0,0,255), 3)
-            cv2.imshow("Board Detection", frame)
-        except Exception as e:
-            print(f"Perspective error: {str(e)}")
-            continue
-        
-        # ----- Chessboard Corner Detection -----
-        warped_gray = cv2.cvtColor(warped, cv2.COLOR_BGR2GRAY)
-        warped_gray = cv2.GaussianBlur(warped_gray, (3,3), 0)
-        ret, corners = cv2.findChessboardCorners(
-            warped_gray, PATTERN_SIZE,
-            flags=cv2.CALIB_CB_ADAPTIVE_THRESH +
-                  cv2.CALIB_CB_NORMALIZE_IMAGE +
-                  cv2.CALIB_CB_FAST_CHECK
-        )
-        
-        if not ret:
-            print("Corners not detected in warped image")
-            continue
-        
-        # Refine corner positions
-        criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 0.001)
-        corners = cv2.cornerSubPix(warped_gray, corners, (11,11), (-1,-1), criteria)
-        cv2.drawChessboardCorners(warped, PATTERN_SIZE, corners, ret)
-        cv2.imshow("Warped with Corners", warped)
-        
-        # ----- Piece Detection & Mapping -----
-        results = model(original)
-        chessboard_state = [[None]*GRID_SIZE[1] for _ in range(GRID_SIZE[0])]
-        
-        for result in results:
-            if result.boxes is None:
-                continue
-                
-            for box in result.boxes:
-                # Extract detection info
-                x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
-                conf = float(box.conf[0])
-                cls_id = int(box.cls[0])
-                if conf < 0.5:  # Confidence threshold
+        intersections = []
+        for v in vertical[:10]:
+            for h in horizontal[:10]:
+                x1, y1, x2, y2 = v
+                x3, y3, x4, y4 = h
+                denom = (x1 - x2)*(y3 - y4) - (y1 - y2)*(x3 - x4)
+                if denom == 0:
                     continue
-                
-                # Transform center point to warped space
-                center = np.array([[(x1+x2)//2, (y1+y2)//2]], dtype="float32")
-                warped_center = cv2.perspectiveTransform(center.reshape(1,1,2), M)[0][0]
-                
-                # Find nearest chessboard square
-                min_dist = float('inf')
-                grid_pos = (-1, -1)
-                
-                for i in range(PATTERN_SIZE[0]):
-                    for j in range(PATTERN_SIZE[1]):
-                        idx = i * PATTERN_SIZE[1] + j
-                        corner_x, corner_y = corners[idx][0]
-                        distance = np.hypot(warped_center[0]-corner_x, warped_center[1]-corner_y)
-                        
-                        if distance < min_dist:
-                            min_dist = distance
-                            grid_pos = (i, j)
-                
-                # Update board state (convert pattern to grid coordinates)
-                if grid_pos != (-1, -1) and min_dist < 50:  # Distance threshold
-                    row = grid_pos[0]
-                    col = grid_pos[1]
-                    chessboard_state[row][col] = model.names[cls_id]
-                    
-                    # Draw annotations
-                    cv2.rectangle(original, (x1,y1), (x2,y2), (0,255,0), 2)
-                    cv2.putText(original, f"{model.names[cls_id]} {conf:.2f}", 
-                                (x1, y1-10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,0), 2)
-        
-        # ----- Save & Display Results -----
-        output_path = os.path.join(output_folder, f"detection_{frame_count}.jpg")
-        cv2.imwrite(output_path, original)
-        frame_count += 1
-        
-        cv2.imshow("Final Detection", original)
-        print("\nCurrent Board State:")
-        for row in chessboard_state:
-            print(row)
-        print("----------------------")
+                px = ((x1*y2 - y1*x2)*(x3 - x4) - (x1 - x2)*(x3*y4 - y3*x4)) / denom
+                py = ((x1*y2 - y1*x2)*(y3 - y4) - (y1 - y2)*(x3*y4 - y3*x4)) / denom
+                if 0 <= px < gray.shape[1] and 0 <= py < gray.shape[0]:
+                    intersections.append([px, py])
 
-# ----- Cleanup -----
-cap.release()
-cv2.destroyAllWindows()
-print("Program terminated")
+        if len(intersections) >= 4:
+            hull = cv2.convexHull(np.array(intersections, dtype="float32"))
+            epsilon = 0.02 * cv2.arcLength(hull, True)
+            approx = cv2.approxPolyDP(hull, epsilon, True)
+            if validate_contour(approx):
+                return approx
+
+    return None
+
+def draw_outline(frame, pts):
+    """Draw the outer board outline in green on the original feed."""
+    if len(pts) == 4:
+        cv2.polylines(frame, [pts.astype(int)], True, (0,255,0), 2)
+    return frame
+
+# ---------- 2. Main Script ----------
+if __name__ == "__main__":
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    model_path = os.path.join(script_dir, 'model1.pt')
+    model = YOLO(model_path)
+
+    cap = cv2.VideoCapture(1)  # or 1 if you have multiple cameras
+    if not cap.isOpened():
+        print("Error: Could not open webcam.")
+        exit()
+
+    BOARD_SIZE = 700
+    BORDER_OFFSET = 5
+
+    # Separate offsets for top/bottom/left/right
+    # Example:
+    #   top = 30, bottom = 45 (1.5x more than top),
+    #   left = 40, right = 40
+    TOP_OFFSET = 60
+    BOTTOM_OFFSET = 100
+    LEFT_OFFSET = 80
+    RIGHT_OFFSET = 80
+
+    GRID_SIZE = 8
+
+    print("Press SPACE to capture and detect, or 'q' to quit.")
+
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        gray = cv2.GaussianBlur(gray, (5,5), 0)
+
+        # 1) Find board contour
+        contour = find_board_contour(gray)
+        if contour is not None:
+            pts = contour.reshape(4, 2)
+            frame = draw_outline(frame, pts)
+
+        cv2.imshow("Chessboard Alignment", frame)
+        key = cv2.waitKey(1) & 0xFF
+        if key == ord('q'):
+            break
+
+        if key == ord(' '):
+            if contour is None or not validate_contour(contour):
+                print("Board detection failed. Adjust camera or lighting.")
+                continue
+
+            try:
+                # 2) Warp the board to BOARD_SIZE x BOARD_SIZE
+                ordered = order_points(contour.reshape(4, 2))
+                src_points = ordered.astype(np.float32)
+                dst_points = np.array([
+                    [BORDER_OFFSET, BORDER_OFFSET],
+                    [BOARD_SIZE - BORDER_OFFSET, BORDER_OFFSET],
+                    [BOARD_SIZE - BORDER_OFFSET, BOARD_SIZE - BORDER_OFFSET],
+                    [BORDER_OFFSET, BOARD_SIZE - BORDER_OFFSET]
+                ], dtype=np.float32)
+
+                M = cv2.getPerspectiveTransform(src_points, dst_points)
+                warped = cv2.warpPerspective(frame, M, (BOARD_SIZE, BOARD_SIZE))
+
+                # 3) Draw the 8x8 grid lines with different top/bottom/left/right offsets
+                warped_grid = warped.copy()
+
+                # Outer rectangle in green
+                cv2.rectangle(
+                    warped_grid,
+                    (LEFT_OFFSET, TOP_OFFSET),
+                    (BOARD_SIZE - RIGHT_OFFSET, BOARD_SIZE - BOTTOM_OFFSET),
+                    (0,255,0), 2
+                )
+
+                # Compute the effective grid width & height
+                grid_width = (BOARD_SIZE - LEFT_OFFSET - RIGHT_OFFSET)
+                grid_height = (BOARD_SIZE - TOP_OFFSET - BOTTOM_OFFSET)
+
+                # We assume the board is still 8x8 squares
+                cell_width = grid_width / GRID_SIZE
+                cell_height = grid_height / GRID_SIZE
+
+                # Draw vertical lines (yellow)
+                for i in range(1, GRID_SIZE):
+                    x = int(LEFT_OFFSET + i * cell_width)
+                    cv2.line(warped_grid, (x, TOP_OFFSET), (x, BOARD_SIZE - BOTTOM_OFFSET), (0,255,255), 1)
+
+                # Draw horizontal lines (yellow)
+                for i in range(1, GRID_SIZE):
+                    y = int(TOP_OFFSET + i * cell_height)
+                    cv2.line(warped_grid, (LEFT_OFFSET, y), (BOARD_SIZE - RIGHT_OFFSET, y), (0,255,255), 1)
+
+                # 4) YOLO detection on the warped board
+                results = model(warped)
+                board_state = [[None]*GRID_SIZE for _ in range(GRID_SIZE)]
+
+                for result in results:
+                    if result.boxes is None:
+                        continue
+                    for box in result.boxes:
+                        x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
+                        conf = float(box.conf[0])
+                        cls_id = int(box.cls[0])
+                        if conf < 0.5:
+                            continue
+
+                        # bounding box center
+                        cx = (x1 + x2) // 2
+                        cy = (y1 + y2) // 2
+
+                        # skip if outside the "inner" region
+                        # i.e. [LEFT_OFFSET, BOARD_SIZE - RIGHT_OFFSET] horizontally
+                        # and [TOP_OFFSET, BOARD_SIZE - BOTTOM_OFFSET] vertically
+                        if not (LEFT_OFFSET <= cx < BOARD_SIZE - RIGHT_OFFSET and
+                                TOP_OFFSET <= cy < BOARD_SIZE - BOTTOM_OFFSET):
+                            continue
+
+                        # Convert center to grid coordinates
+                        grid_x = int((cx - LEFT_OFFSET) // cell_width)
+                        grid_y = int((cy - TOP_OFFSET) // cell_height)
+
+                        if 0 <= grid_x < GRID_SIZE and 0 <= grid_y < GRID_SIZE:
+                            label = model.names[cls_id]
+                            board_state[grid_y][grid_x] = label
+
+                            cv2.rectangle(warped_grid, (x1,y1), (x2,y2), (0,255,0), 2)
+                            cv2.putText(warped_grid, label, (x1, y1-10),
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,0), 2)
+
+                # 5) Show final results
+                cv2.imshow("Warped + Grid + Pieces", warped_grid)
+
+                print("\nChessboard State:")
+                for row in board_state:
+                    print(row)
+
+            except Exception as e:
+                print("Error in perspective transform or detection:", e)
+
+    cap.release()
+    cv2.destroyAllWindows()
+    print("Program terminated.")

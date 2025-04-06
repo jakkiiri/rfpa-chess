@@ -3,8 +3,86 @@ import numpy as np
 import torch
 from ultralytics import YOLO
 import os
+import copy
 
 # ---------- 1. Helper Functions ----------
+def get_chess_notation(grid_row, grid_col):
+    """Convert grid position (0-7, 0-7) to chess notation (a1-h8)"""
+    file = chr(ord('a') + grid_col)
+    rank = grid_row + 1  # Adjusted to correctly map grid_row 0 to rank 1
+    return f"{file}{rank}"
+
+def detect_move(previous_state, current_state):
+    """
+    Compare two consecutive board states and return the move in algebraic notation.
+    Returns None if no valid move is detected.
+    """
+    moved_pieces = []
+    removed_pieces = []
+    new_pieces = []
+
+    # Find all changes
+    for i in range(8):
+        for j in range(8):
+            prev = previous_state[i][j]
+            curr = current_state[i][j]
+            if prev != curr:
+                if curr is None:
+                    removed_pieces.append((i, j, prev))
+                elif prev is None:
+                    new_pieces.append((i, j, curr))
+                else:
+                    moved_pieces.append((i, j, prev, curr))
+
+    # Handle normal moves
+    if len(new_pieces) == 1 and len(removed_pieces) == 1:
+        # Find source and destination
+        dest_row, dest_col, piece = new_pieces[0]
+        source_row, source_col, _ = removed_pieces[0]
+        
+        # Get chess notation
+        source = get_chess_notation(source_row, source_col)
+        dest = get_chess_notation(dest_row, dest_col)
+        
+        # Determine piece type (uppercase for white)
+        piece_type = piece.upper() if piece.islower() else piece
+        
+        # Handle captures
+        capture = current_state[dest_row][dest_col] != previous_state[dest_row][dest_col]
+        
+        # Build algebraic notation
+        if piece_type == 'P':  # Pawn move
+            if capture:
+                move = f"{source[0]}x{dest}"
+            else:
+                move = dest
+        else:  # Other pieces
+            if capture:
+                move = f"{piece_type}x{dest}"
+            else:
+                move = f"{piece_type}{dest}"
+        
+        # Check for castling
+        if piece_type == 'K' and abs(source_col - dest_col) == 2:
+            if dest_col == 6:  # Kingside
+                return "O-O"
+            elif dest_col == 2:  # Queenside
+                return "O-O-O"
+        
+        return move
+    
+    # Handle pawn promotion
+    elif len(new_pieces) == 1 and len(removed_pieces) == 1:
+        dest_row, dest_col, new_piece = new_pieces[0]
+        source_row, source_col, old_piece = removed_pieces[0]
+        
+        if old_piece.lower() == 'p' and ((dest_row == 0 and new_piece.islower()) or 
+                                       (dest_row == 7 and new_piece.isupper())):
+            promotion = new_piece.upper()
+            return f"{get_chess_notation(dest_row, dest_col)}={promotion}"
+    
+    return None  # No clear move detected
+
 def order_points(pts):
     """Arrange 4 corner points in consistent order: top-left, top-right, bottom-right, bottom-left."""
     rect = np.zeros((4, 2), dtype="float32")
@@ -92,16 +170,14 @@ if __name__ == "__main__":
     BORDER_OFFSET = 5
 
     # Separate offsets for top/bottom/left/right
-    # Example:
-    #   top = 30, bottom = 45 (1.5x more than top),
-    #   left = 40, right = 40
-    TOP_OFFSET = 60
-    BOTTOM_OFFSET = 100
-    LEFT_OFFSET = 80
-    RIGHT_OFFSET = 80
+    TOP_OFFSET = 50
+    BOTTOM_OFFSET = 50
+    LEFT_OFFSET = 50
+    RIGHT_OFFSET = 50
 
     GRID_SIZE = 8
 
+    previous_state = None
     print("Press SPACE to capture and detect, or 'q' to quit.")
 
     while True:
@@ -114,12 +190,12 @@ if __name__ == "__main__":
 
         # 1) Find board contour
         contour = find_board_contour(gray)
-        if contour is not None:
+        if contour is not None: 
             pts = contour.reshape(4, 2)
             frame = draw_outline(frame, pts)
 
         cv2.imshow("Chessboard Alignment", frame)
-        key = cv2.waitKey(1) & 0xFF
+        key = cv2.waitKey(1) & 0xFFf
         if key == ord('q'):
             break
 
@@ -190,15 +266,14 @@ if __name__ == "__main__":
                         cy = (y1 + y2) // 2
 
                         # skip if outside the "inner" region
-                        # i.e. [LEFT_OFFSET, BOARD_SIZE - RIGHT_OFFSET] horizontally
-                        # and [TOP_OFFSET, BOARD_SIZE - BOTTOM_OFFSET] vertically
                         if not (LEFT_OFFSET <= cx < BOARD_SIZE - RIGHT_OFFSET and
                                 TOP_OFFSET <= cy < BOARD_SIZE - BOTTOM_OFFSET):
                             continue
 
                         # Convert center to grid coordinates
                         grid_x = int((cx - LEFT_OFFSET) // cell_width)
-                        grid_y = int((cy - TOP_OFFSET) // cell_height)
+                        # Invert grid_y to align bottom of the image as rank 1
+                        grid_y = 7 - int((cy - TOP_OFFSET) // cell_height)
 
                         if 0 <= grid_x < GRID_SIZE and 0 <= grid_y < GRID_SIZE:
                             label = model.names[cls_id]
@@ -214,6 +289,17 @@ if __name__ == "__main__":
                 print("\nChessboard State:")
                 for row in board_state:
                     print(row)
+
+                # Detect move if we have a previous state
+                if previous_state is not None:
+                    detected_move = detect_move(previous_state, board_state)
+                    if detected_move:
+                        print(f"\nDetected move: {detected_move}")
+                    else:
+                        print("\nNo clear move detected")
+
+                # Update previous state
+                previous_state = copy.deepcopy(board_state)
 
             except Exception as e:
                 print("Error in perspective transform or detection:", e)
